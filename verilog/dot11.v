@@ -43,9 +43,11 @@ module dot11 (
     /////////////////////////////////////////////////////////
     
     // decode status
+    // (* mark_debug = "true", DONT_TOUCH = "TRUE" *) 
     output reg [3:0] state,
     output reg [3:0] status_code,
     output state_changed,
+    output reg [31:0] state_history,
 
     // power trigger
     output power_trigger,
@@ -60,12 +62,14 @@ module dot11 (
     output long_preamble_detected,
     output [31:0] sync_long_out,
     output sync_long_out_strobe,
+    output wire signed [31:0] phase_offset_taken,
     output [2:0] sync_long_state,
 
     // equalizer
     output [31:0] equalizer_out,
     output equalizer_out_strobe,
     output [2:0] equalizer_state,
+    output wire ofdm_symbol_eq_out_pulse,
 
     // legacy signal info
     output reg legacy_sig_stb,
@@ -101,10 +105,35 @@ module dot11 (
     output conv_decoder_out_stb,
 
     output descramble_out,
-    output descramble_out_strobe
+    output descramble_out_strobe,
+
+    // for side channel
+    output wire [31:0] csi,
+    output wire csi_valid
 );
 
 `include "common_params.v"
+
+////////////////////////////////////////////////////////////////////////////////
+// extra info output to ease side info and viterbi state monitor
+////////////////////////////////////////////////////////////////////////////////
+reg  [2:0] equalizer_state_reg;
+
+assign ofdm_symbol_eq_out_pulse = (equalizer_state==4 && equalizer_state_reg==6);
+
+always @(posedge clock) begin
+    if (reset==1) begin
+        state_history <= 0;
+        equalizer_state_reg <= 0;
+    end else begin
+        equalizer_state_reg <= equalizer_state;
+        if (state_changed) begin
+            state_history[3:0] <= state;
+            state_history[31:4] <= state_history[27:0];
+        end 
+    end
+end
+////////////////////////////////////////////////////////////////////////////////
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -126,7 +155,6 @@ rot_lut rot_lut_inst (
     .doutb(eq_rot_data)
 );
 ////////////////////////////////////////////////////////////////////////////////
-
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -178,6 +206,7 @@ reg sync_short_reset;
 reg sync_long_reset;
 wire sync_short_enable = state == S_SYNC_SHORT;
 reg sync_long_enable;
+wire [15:0] num_ofdm_symbol;
 
 reg equalizer_reset;
 reg equalizer_enable;
@@ -322,10 +351,12 @@ sync_long sync_long_inst (
     .metric(sync_long_metric),
     .metric_stb(sync_long_metric_stb),
     .long_preamble_detected(long_preamble_detected),
+    .phase_offset_taken(phase_offset_taken),
     .state(sync_long_state),
 
     .sample_out(sync_long_out),
-    .sample_out_strobe(sync_long_out_strobe)
+    .sample_out_strobe(sync_long_out_strobe),
+    .num_ofdm_symbol(num_ofdm_symbol)
 );
 
 equalizer equalizer_inst (
@@ -336,6 +367,7 @@ equalizer equalizer_inst (
     .sample_in(sync_long_out),
     .sample_in_strobe(sync_long_out_strobe),
     .ht_next(ht_next),
+    .pkt_ht(pkt_ht),
 
     .phase_in_i(eq_phase_in_i),
     .phase_in_q(eq_phase_in_q),
@@ -350,7 +382,10 @@ equalizer equalizer_inst (
     .sample_out(equalizer_out),
     .sample_out_strobe(equalizer_out_strobe),
 
-    .state(equalizer_state)
+    .state(equalizer_state),
+
+    .csi(csi),
+    .csi_valid(csi_valid)
 );
 
 
@@ -478,6 +513,8 @@ always @(posedge clock) begin
 
         case(state)
             S_WAIT_POWER_TRIGGER: begin
+                pkt_begin <= 0;
+                pkt_ht <= 0;
                 crc_reset <= 0;
                 short_gi <= 0;
                 demod_is_ongoing <= 0;
@@ -621,7 +658,6 @@ always @(posedge clock) begin
                         pkt_header_valid <= 1;
                         pkt_header_valid_strobe <= 1;
                         pkt_begin <= 1;
-                        pkt_ht <= 0;
                         state <= S_DECODE_DATA;
                     end
                 end
@@ -659,7 +695,6 @@ always @(posedge clock) begin
                     pkt_header_valid <= 1;
                     pkt_header_valid_strobe <= 1;
                     pkt_begin <= 1;
-                    pkt_ht <= 0;
                     state <= S_DECODE_DATA;
                 end
             end
@@ -781,7 +816,16 @@ always @(posedge clock) begin
                     state <= S_HT_SIG_ERROR;
                 end else begin
                     sync_long_out_count <= 0;
-                    state <= S_HT_STS;
+                    // When decoding 80211n packets, a lower clock running platform (i.e. zedboard @ 100MHz) will spend more than 4usec to decode an entire OFDM symbol.
+                    // This creates misalignment between the control state and the actual decoding process since a feedback mechanism is not applied.
+                    // By the time the 1st OFDM DATA symbol is being decoded, the control is in HT-LTS state and the equalizer module mistakenly calculates the channel gain.
+                    // A quick fix for this is to bypass the HT-STS symbol to re-establish the alignment. Afterall, HT-STS is not used in this module.
+                    if (num_ofdm_symbol == 5) begin
+                        state <= S_HT_STS;
+                    end else begin
+                        ht_next <= 1;
+                        state <= S_HT_LTS;
+                    end
                 end
             end
 
@@ -809,6 +853,8 @@ always @(posedge clock) begin
             end
 
             S_HT_LTS: begin
+                pkt_header_valid <= 0;
+                pkt_header_valid_strobe <= 0;
                 short_gi <= ht_sgi;
                 if (sync_long_out_strobe) begin
                     sync_long_out_count <= sync_long_out_count + 1;
